@@ -1,0 +1,247 @@
+@AndroidEntryPoint
+class UserFragment() : Fragment() {
+
+    private var _binding : FragmentUserBinding? = null
+    val binding get() = _binding!!
+
+    private val viewModel: UserViewModel by viewModels()
+    private val adapter: UserAdapter by lazy(LazyThreadSafetyMode.NONE) {
+        UserAdapter {
+            val message = getString(R.string.on_user_pressed, it.name)
+            showToast(message)
+        }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentUserBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(
+        view: View,
+        savedInstanceState: Bundle?,
+    ){
+        setUpRecyclerView()
+        handleDate()
+
+        binding.pullToRefresh.setOnRefreshListener {
+            viewModel.refreshUsers()
+        }
+    }
+
+    private fun setUpRecyclerView() = with(binding){
+        recyclerView.adapter = adapter
+        recyclerView.visibility = View.VISIBLE
+    }
+
+    private fun handleDate(){
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED){
+                viewModel.userState.collect{ state ->
+                    hideAll()
+                    when {
+                        state.users.isNotEmpty() -> {
+                            updateUi(state.users)
+                        }
+                        state.isLoading -> showLoading()
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED){
+                viewModel.userEvent.collect { event ->
+                    when(event) {
+                        is UserEvent.ShowError -> {
+                            val message = event.uiText.asString(requireActivity())
+                            showToast(message)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateUi(users: List<User>) = with(binding) {
+        adapter.submitList(users)
+        recyclerView.visibility = View.VISIBLE
+        pullToRefresh.isRefreshing = false
+    }
+
+    private fun showLoading() = with(binding){
+        progressBar.visibility = View.VISIBLE
+    }
+
+    private fun hideAll() = with(binding){
+        progressBar.visibility = View.GONE
+        recyclerView.visibility = View.GONE
+    }
+
+    private fun showToast(message: String) {
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    }
+
+
+    override fun onDestroyView() {
+        _binding = null
+        super.onDestroyView()
+    }
+}
+
+class LoadUsersUseCase @Inject constructor(
+  private val userRepository: UserRepository,
+) {
+    suspend operator fun invoke(): Flow<List<User>> {
+        userRepository.loadUsers()
+    }
+}
+
+data class UserState(
+    val users: List<User> = emptyList(),
+    val isLoading: Boolean = true
+)
+
+sealed interface UserEvent {
+    data class ShowError(val uiText: UiText) : UserEvent
+}
+
+@HiltViewModel
+class UserViewModel @Inject constructor(
+    private val loadUsersUseCase: LoadUsersUseCase
+) : ViewModel() {
+
+    private val _userState = MutableStateFlow<UserState>(UserState())
+    val userState: StateFlow<UserState> = _userState
+        .onStart {
+            loadItems()
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = _userState.value
+        )
+
+    private val _userEvent = Channel<UserEvent>()
+    val userEvent = _userEvent.receiveAsFlow()
+
+    private fun loadItems() {
+        viewModelScope.launch {
+            showLoading()
+            loadUsersUseCase()
+                .catch {throwable ->
+                    val uiText = throwable.asApplicationException().toUiText()
+                    _userEvent.send(UserEvent.ShowError(uiText))
+                }
+                .onEach { hideLoading() }
+                .collect { users ->
+                    _userState.update { state ->
+                        state.copy(
+                            users = users
+                        )
+                    }
+                }
+        }
+    }
+
+    fun refreshUsers() {
+        loadItems()
+    }
+
+    private fun showLoading() {
+        _userState.update { state ->
+            state.copy(
+                isLoading = true
+            )
+        }
+    }
+
+    private fun hideLoading() {
+        _userState.update { state ->
+            state.copy(
+                isLoading = false
+            )
+        }
+    }
+}
+
+class UserAdapterDiffCallback(): DiffUtil.ItemCallback<User>() {
+    override fun areItemsTheSame(
+        oldItem: User,
+        newItem: User
+    ): Boolean = oldItem.id == newItem.id
+
+    override fun areContentsTheSame(
+        oldItem: User,
+        newItem: User
+    ): Boolean = oldItem == newItem
+}
+
+// ItemAdapter.kt
+class UserAdapter(
+    private val onUserPressed: (User) -> Unit,
+): ListAdapter<User, UserAdapter.UserViewHolder>(UserAdapterDiffCallback()), View.OnClickListener {
+    class UserViewHolder(val binding: ItemUserBinding) : RecyclerView.ViewHolder(binding.root){
+        fun bind(user: User) = with(binding) {
+            binding.textView.text = user.name
+        }
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): UserViewHolder {
+        val binding = ItemUserBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+
+        binding.root.setOnClickListener(this)
+
+        return UserViewHolder(binding)
+    }
+
+    override fun onBindViewHolder(holder: UserViewHolder, position: Int) {
+        val item = getItem(position)
+        holder.binding.root.tag = item
+        holder.bind(item)
+    }
+
+    override fun onClick(v: View) {
+        val user = v.tag as? User ?: error("User is not found")
+        onUserPressed.invoke(user)
+    }
+}
+
+// Item.kt
+data class User(
+    val id: String,
+    val name: String
+)
+
+fun Throwable.asApplicationException(): ApplicationExceptions =
+    this as? ApplicationExceptions ?: UnknownException()
+
+//Customs exceptions
+sealed class ApplicationExceptions : Exception()
+class ConnectionException : ApplicationExceptions()
+class UnknownException : ApplicationExceptions()
+
+//Utils
+sealed interface UiText {
+    data class StringResource(
+        @StringRes val resId: Int,
+        val args: List<Any> = emptyList()
+    ) : UiText
+}
+
+fun ApplicationExceptions.toUiText(): UiText {
+    return when (this) {
+        is ConnectionException -> UiText.StringResource(resId = R.string.network_error)
+        is UnknownException -> UiText.StringResource(resId = R.string.unknown_error)
+    }
+}
+
+fun UiText.asString(context: Context): String {
+    return when (this) {
+        is UiText.StringResource -> context.getString(resId, *args.toTypedArray())
+    }
+}
