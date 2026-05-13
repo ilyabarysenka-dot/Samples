@@ -1,0 +1,232 @@
+@AndroidEntryPoint
+class UsersFragment : Fragment() {
+
+    private var _viewBinding: FragmentUsersBinding? = null
+    private val viewBinding get() = _viewBinding!!
+
+    private val viewModel: UsersViewModel by viewModels()
+
+    private val adapter: UserRecyclerviewAdapter by lazy(mode = LazyThreadSafetyMode.NONE) {
+        UserRecyclerviewAdapter()
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _viewBinding = FragmentUsersBinding.inflate(inflater, container, false)
+        return viewBinding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupRecyclerView()
+        handleData()
+        viewBinding.refreshBtn.setOnClickListener { viewModel.loadData() }
+    }
+
+    private fun handleData() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.viewState.collect { result ->
+                    hideAll()
+                    when (result) {
+                        Result.Loading -> showLoading()
+                        
+                        is Result.Success -> {
+                            updateList(result.value.userDetails)
+                        }
+
+                        is Result.Error -> {
+                            showError(result.message.asString(requireContext()))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateList(userDetails: List<UserDetails>) {
+        adapter.submitList(userDetails)
+        showSuccess()
+    }
+
+    private fun showLoading() {
+        viewBinding.progressBar.visibility = View.VISIBLE
+    }
+
+    private fun showSuccess() {
+        viewBinding.userDetailsRecyclerView.visibility = View.VISIBLE
+    }
+
+    fun showError(message: String) = with(viewBinding) {
+        textError.text = message
+        textError.visibility = View.VISIBLE
+        refreshBtn.visibility = View.VISIBLE
+    }
+
+    private fun hideAll() = with(viewBinding) {
+        refreshBtn.visibility = View.GONE
+        textError.visibility = View.GONE
+        progressBar.visibility = View.GONE
+        userDetailsRecyclerView.visibility = View.GONE
+    }
+
+    private fun setupRecyclerView() = with(viewBinding) {
+        userDetailsRecyclerView.adapter = adapter
+        userDetailsRecyclerView.setHasFixedSize(true)
+    }
+
+    override fun onDestroyView() {
+        _viewBinding = null
+        super.onDestroyView()
+    }
+}
+
+private class DiffUtilCallback : DiffUtil.ItemCallback<UserDetails>() {
+    override fun areItemsTheSame(oldItem: UserDetails, newItem: UserDetails): Boolean {
+        return oldItem.id == newItem.id
+    }
+
+    override fun areContentsTheSame(oldItem: UserDetails, newItem: UserDetails): Boolean {
+        return oldItem == newItem
+    }
+
+    override fun getChangePayload(
+        oldItem: UserDetails,
+        newItem: UserDetails
+    ): Any? {
+        val bundle = bundleOf()
+        if (oldItem.name != newItem.name) {
+            bundle.putString(NAME_KEY, newItem.name)
+        }
+        if (oldItem.email != newItem.email) {
+            bundle.putString(EMAIL_KEY, newItem.email)
+        }
+        return if (bundle.isEmpty) null else bundle
+    }
+
+    companion object {
+        const val NAME_KEY = "NAME_KEY"
+        const val EMAIL_KEY = "EMAIL_KEY"
+    }
+}
+
+data class UserDetails(
+    val id: String,
+    val name: String,
+    val email: String
+)
+
+class UserRecyclerviewAdapter() :
+    ListAdapter<UserDetails, UserRecyclerviewAdapter.UserViewHolder>(DiffUtilCallback()) {
+
+    override fun onCreateViewHolder(
+        parent: ViewGroup,
+        viewType: Int
+    ): UserViewHolder {
+        val binding = ItemUserBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+
+        return UserViewHolder(binding)
+    }
+
+    override fun onBindViewHolder(
+        holder: UserViewHolder,
+        position: Int
+    ) {
+        val user = getItem(position)
+        holder.bind(user)
+    }
+
+
+    override fun onBindViewHolder(
+        holder: UserViewHolder,
+        position: Int,
+        payloads: MutableList<Any?>
+    ) {
+        if (payloads.isNotEmpty()) {
+            val bundle = payloads[0] as Bundle
+            bundle.getString(DiffUtilCallback.NAME_KEY)?.let {
+                holder.binding.textName.text = it
+            }
+            bundle.getString(DiffUtilCallback.EMAIL_KEY)?.let {
+                holder.binding.textEmail.text = it
+            }
+        } else {
+            super.onBindViewHolder(holder, position, payloads)
+        }
+    }
+
+    class UserViewHolder(val binding: ItemUserBinding) : RecyclerView.ViewHolder(binding.root) {
+
+        fun bind(user: UserDetails) {
+            binding.textName.text = user.name
+            binding.textEmail.text = user.email
+        }
+    }
+}
+
+@HiltViewModel
+class UsersViewModel @Inject constructor(
+    private val userRepository: UserRepository,
+) : ViewModel() {
+
+    data class State(
+        val userDetails: List<UserDetails> = emptyList(),
+    )
+
+    private val _userState = MutableStateFlow<Result<State>>(Result.Loading)
+    val viewState: StateFlow<Result<State>> = _userState
+        .onStart { loadData() }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = _userState.value
+        )
+
+    fun loadData() {
+        viewModelScope.launch {
+            _userState.update { Result.Loading }
+            delay(2_000L)
+            try {
+                val users = userRepository.getAllUsers().first()
+                _userState.update { Result.Success(State(userDetails = users)) }
+            } catch (e: ApplicationExceptions) {
+                _userState.update { Result.Error(e.toUiText()) }
+            }
+        }
+    }
+}
+
+//Customs exceptions
+sealed class ApplicationExceptions : Exception()
+class ConnectionException : ApplicationExceptions()
+abstract class UnknownException : ApplicationExceptions()
+
+//Utils
+sealed interface UiText {
+    data class StringResource(
+        @StringRes val resId: Int,
+        val args: List<Any> = emptyList()
+    ) : UiText
+}
+
+fun ApplicationExceptions.toUiText(): UiText {
+    return when (this) {
+        is ConnectionException -> UiText.StringResource(resId = R.string.network_error)
+        is UnknownException -> UiText.StringResource(resId = R.string.unknown_error)
+    }
+}
+
+fun UiText.asString(context: Context): String {
+    return when (this) {
+        is UiText.StringResource -> context.getString(resId, *args.toTypedArray())
+    }
+}
+
+sealed interface Result<out T> {
+    data class Success<T>(val value: T) : Result<T>
+    data class Error(val message: UiText) : Result<Nothing>
+    data object Loading : Result<Nothing>
+}
