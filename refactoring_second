@@ -1,0 +1,277 @@
+@AndroidEntryPoint
+class ProfileFragment : Fragment() {
+    private var _binding: FragmentProfileBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: ProfileViewModel by viewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentProfileBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.profileState.collect {
+                    hideAll()
+                    when (it) {
+                        is Result.Loading -> showLoading()
+
+                        is Result.Success -> {
+                            updateUI(user = it.value.user)
+                            showSuccess()
+                        }
+
+                        is Result.Error -> {
+                            showError(it.message.asString(requireContext()))
+                        }
+                    }
+                }
+            }
+        }
+
+        setOnclickListeners()
+    }
+
+    private fun setOnclickListeners() = with(binding) {
+        refreshButton.setOnClickListener {
+            viewModel.loadUserProfile()
+        }
+        saveButton.setOnClickListener {
+            val userId = userId.text.toString()
+            viewModel.saveUser(userId)
+        }
+    }
+
+    private fun updateUI(user: User) {
+        binding.userName.text = user.name
+        binding.userId.text = user.id
+    }
+
+    private fun showSuccess() = with(binding) {
+        userName.visibility = View.VISIBLE
+        userId.visibility = View.VISIBLE
+        saveButton.visibility = View.VISIBLE
+    }
+
+    private fun showError(message: String) = with(binding) {
+        errorText.text = message
+        errorText.visibility = View.VISIBLE
+        refreshButton.visibility = View.VISIBLE
+    }
+
+    private fun showLoading() = with(binding) {
+        progressBar.visibility = View.VISIBLE
+    }
+
+    private fun hideAll() = with(binding) {
+        progressBar.visibility = View.GONE
+        refreshButton.visibility = View.GONE
+        saveButton.visibility = View.GONE
+        errorText.visibility = View.GONE
+        userName.visibility = View.GONE
+        userId.visibility = View.GONE
+    }
+
+    override fun onDestroyView() {
+        _binding = null
+        super.onDestroyView()
+    }
+}
+
+data class User(
+    val id: String = EMPTY_ID,
+    val name: String = EMPTY_NAME,
+) {
+    companion object {
+        const val EMPTY_ID = ""
+        const val EMPTY_NAME = ""
+    }
+}
+
+@HiltViewModel
+class ProfileViewModel @Inject constructor(
+    private val getUserProfileUseCase: GetUserProfileUseCase,
+    private val saveUserUseCase: SaveUserUseCase,
+) : ViewModel() {
+
+    data class State(
+        val user: User = User(),
+    )
+
+    private val _profileState = MutableStateFlow<Result<State>>(Result.Loading)
+    val profileState: StateFlow<Result<State>> = _profileState
+        .onStart {
+            loadUserProfile()
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = _profileState.value
+        )
+
+    fun loadUserProfile() {
+        viewModelScope.launch {
+            showLoading()
+            getUserProfileUseCase()
+                .onSuccess { user ->
+                    _profileState.update {
+                        Result.Success(State(user = user))
+                    }
+                }
+                .onFailure { errorHandling(it) }
+        }
+    }
+
+    fun saveUser(userId: String) {
+        viewModelScope.launch {
+            saveUserUseCase(userId)
+                .onFailure { errorHandling(it) }
+        }
+    }
+
+    private fun showLoading() {
+        _profileState.update {
+            Result.Loading
+        }
+    }
+
+    private fun errorHandling(throwable: Throwable) {
+        val uiText = throwable.asApplicationException().toUiText()
+        _profileState.update {
+            Result.Error(uiText)
+        }
+    }
+}
+
+class GetUserProfileUseCase @Inject constructor(
+    private val secureStorage: SecureStorage,
+    private val userRepository: UserRepository,
+) {
+    suspend operator fun invoke(): kotlin.Result<User> {
+        val userId = secureStorage.userIdStateFlow.first()
+        val user = userRepository.getUserDetails(userId)
+        return kotlin.Result.success(User(id = userId, name = "User Name"))
+    }
+}
+
+class SaveUserUseCase @Inject constructor(
+    private val secureStorage: SecureStorage,
+) {
+    operator fun invoke(userId: String): kotlin.Result<Unit> {
+        return kotlin.Result.failure(UnknownException())
+    }
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+interface UserModule {
+
+    @Binds
+    fun bindsSecureStorage(secureStorageImpl: SecureStorageImpl): SecureStorage
+
+}
+
+interface SecureStorage {
+    val userIdStateFlow: StateFlow<String>
+    fun setUserId(userId: String)
+}
+
+class SecureStorageImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : SecureStorage {
+
+    private val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val _userIdStateFlow = MutableStateFlow(getUserId())
+    override val userIdStateFlow: StateFlow<String> = _userIdStateFlow.asStateFlow()
+
+    override fun setUserId(userId: String) {
+        preferences.edit {
+            putString(USER_ID_KEY, userId)
+        }
+        _userIdStateFlow.update { userId }
+    }
+
+    private fun getUserId(): String {
+        return preferences.getString(USER_ID_KEY, "") ?: ""
+    }
+
+    companion object {
+        private const val PREFS_NAME = "PREFS_NAME"
+        private const val USER_ID_KEY = "USER_ID_KEY"
+    }
+
+}
+
+//Imagine this Local property
+object BuildConfig {
+    const val BASE_URL = "https://api.example.com/"
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+object NetworkModule {
+
+    @Provides
+    fun provideOkHttpClient(): OkHttpClient {
+        return OkHttpClient.Builder()
+            .build()
+    }
+
+    @Provides
+    fun provideRetrofit(okHttpClient: OkHttpClient): Retrofit {
+        return Retrofit.Builder()
+            .baseUrl(BuildConfig.BASE_URL)
+            .client(okHttpClient)
+            .addConverterFactory(Json.asConverterFactory("application/json".toMediaType()))
+            .build()
+    }
+
+    @Provides
+    fun provideApiService(retrofit: Retrofit): ApiService {
+        return retrofit.create(ApiService::class.java)
+    }
+
+}
+
+//Customs exceptions
+sealed class ApplicationExceptions : Exception()
+class ConnectionException : ApplicationExceptions()
+class UnknownException : ApplicationExceptions()
+
+//Utils
+sealed interface UiText {
+    data class StringResource(
+        @StringRes val resId: Int,
+        val args: List<Any> = emptyList()
+    ) : UiText
+}
+
+fun Throwable.asApplicationException(): ApplicationExceptions =
+    this as? ApplicationExceptions ?: UnknownException()
+
+fun ApplicationExceptions.toUiText(): UiText {
+    return when (this) {
+        is ConnectionException -> UiText.StringResource(resId = R.string.network_error)
+        is UnknownException -> UiText.StringResource(resId = R.string.unknown_error)
+    }
+}
+
+fun UiText.asString(context: Context): String {
+    return when (this) {
+        is UiText.StringResource -> context.getString(resId, *args.toTypedArray())
+    }
+}
+
+sealed class Result<out T> {
+    object Loading : Result<Nothing>()
+    data class Success<T>(val value: T) : Result<T>()
+    data class Error(val message: UiText) : Result<Nothing>()
+}
