@@ -1,0 +1,235 @@
+@AndroidEntryPoint
+class UsersActivity : AppCompatActivity() {
+
+    private var _binding: ActivityMainBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: UserViewModel by viewModels()
+    private val adapter: UsersAdapter by lazy(LazyThreadSafetyMode.NONE) {
+        UsersAdapter(
+            onUserPressed = { userId ->
+                val intent = Intent(this, DetailActivity::class.java)
+                intent.putExtra(USER_ID, userId)
+                startActivity(intent)
+            }
+        )
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        _binding = ActivityMainBinding.inflate(layoutInflater).also {
+            setContentView(it.root)
+        }
+
+        setUpRecyclerView()
+
+        lifecycleScope.launch {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.usersState.collect { state ->
+                    hideAll()
+                    when {
+                        state.isLoading -> {
+                            binding.progressBar.visibility = View.VISIBLE
+                        }
+
+                        !state.isLoading && state.users.isNotEmpty() -> {
+                            adapter.submitList(state.users)
+                            binding.recyclerView.visibility = View.VISIBLE
+                            binding.onDetailScreenButton.visibility = View.VISIBLE
+                        }
+                    }
+
+                }
+            }
+        }
+    }
+
+    private fun setUpRecyclerView() = with(binding) {
+        recyclerView.adapter = adapter
+        recyclerView.layoutManager = LinearLayoutManager(this@UsersActivity)
+    }
+
+    private fun hideAll() = with(binding) {
+        recyclerView.visibility = View.GONE
+        progressBar.visibility = View.GONE
+    }
+
+    override fun onDestroy() {
+        _binding = null
+        super.onDestroy()
+    }
+
+    companion object {
+        const val USER_ID = "USER_ID"
+    }
+}
+
+data class UsersState(
+    val users: List<User> = emptyList(),
+    val isLoading: Boolean = true,
+)
+
+@HiltViewModel
+class UserViewModel @Inject constructor(
+    getUsersUseCase: GetUsersUseCase,
+) : ViewModel() {
+    private val _usersState = MutableStateFlow<UsersState>(UsersState())
+    val usersState = combine(
+        _usersState,
+        getUsersUseCase.invoke()
+    ) { state, users ->
+        state.copy(
+            users = users,
+            isLoading = false
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000L),
+        initialValue = _usersState.value
+    )
+}
+
+class UserDiffUtil() : DiffUtil.ItemCallback<User>() {
+    override fun areItemsTheSame(
+        oldItem: User,
+        newItem: User,
+    ): Boolean = oldItem.id == newItem.id
+
+    override fun areContentsTheSame(
+        oldItem: User,
+        newItem: User
+    ): Boolean = oldItem == newItem
+}
+
+class UsersAdapter(
+    private val onUserPressed: (userId: String) -> Unit,
+) : ListAdapter<User, UsersAdapter.UserViewHolder>(UserDiffUtil()), View.OnClickListener {
+
+    override fun onCreateViewHolder(
+        parent: ViewGroup,
+        viewType: Int,
+    ): UserViewHolder {
+        val binding = ItemUserBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+
+        binding.root.setOnClickListener(this)
+
+        return UserViewHolder(binding)
+    }
+
+    override fun onBindViewHolder(
+        holder: UserViewHolder,
+        position: Int,
+    ) {
+        val user = getItem(position)
+        holder.itemView.tag = user
+        holder.bind(user)
+    }
+
+    override fun onClick(v: View) {
+        val userId = (v.tag as? User)?.id ?: error("There is no such user")
+        onUserPressed.invoke(userId)
+    }
+
+    class UserViewHolder(val binding: ItemUserBinding) : RecyclerView.ViewHolder(binding.root) {
+        fun bind(user: User) = with(binding) {
+            binding.textUserName.text = user.name
+        }
+    }
+}
+
+class GetUsersUseCase @Inject constructor(
+    private val usersRepository: UsersRepository,
+) {
+    operator fun invoke(): Flow<List<User>> {
+        return usersRepository.getUsers()
+    }
+}
+
+interface UsersRepository {
+    fun getUsers(): Flow<List<User>>
+}
+
+@Singleton
+class UsersRepositoryImpl @Inject constructor(
+    private val usersDao: UsersDao,
+) : UsersRepository {
+    override fun getUsers(): Flow<List<User>> {
+        return usersDao.getUsers().map { userEntities ->
+            userEntities.map { userEntity ->
+                userEntity.toUser()
+            }
+        }
+    }
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+interface RepoModule {
+    @Binds
+    fun bindUsersRepository(impl: UsersRepositoryImpl): UsersRepository
+}
+
+object DatabaseConstants {
+
+    const val NAME = "app_database"
+    const val VERSION = 1
+
+    object TABLE {
+        const val USERS = "USERS"
+    }
+}
+
+@Entity(tableName = USERS)
+data class UserEntity(
+    @PrimaryKey(autoGenerate = true)
+    @ColumnInfo(name = "user_id")
+    val userId: Long,
+    @ColumnInfo(name = "name") val name: String
+) {
+    fun toUser(): User = User(
+        id = userId.toString(),
+        name = name
+    )
+}
+
+@Dao
+interface UsersDao {
+    @Query("SELECT* FROM $USERS")
+    fun getUsers(): Flow<List<UserEntity>>
+}
+
+@Database(
+    entities = [UserEntity::class],
+    version = VERSION
+)
+abstract class AppDatabase() : RoomDatabase() {
+    abstract fun getUsersDao(): UsersDao
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+object DatabaseModule {
+
+    @Provides
+    @Singleton
+    fun provideDatabase(
+        @ApplicationContext context: Context,
+    ): AppDatabase {
+        return Room.databaseBuilder(
+            context = context,
+            klass = AppDatabase::class.java,
+            name = NAME,
+        ).build()
+    }
+
+    @Provides
+    @Singleton
+    fun provideUsersDao(database: AppDatabase): UsersDao {
+        return database.getUsersDao()
+    }
+}
+
+data class User(
+    val id: String,
+    val name: String,
+)
