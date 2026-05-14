@@ -1,0 +1,189 @@
+data class DataState(
+    val data: List<String> = emptyList(),
+    val isLoading: Boolean = true,
+)
+
+interface DataEvent {
+    data class ShowError(val uiText: UiText) : DataEvent
+}
+
+@HiltViewModel
+class DataViewModel @Inject constructor(
+    private val getDataFlowUseCase: GetDataFlowUseCase
+) : ViewModel() {
+
+    private val _dataState = MutableStateFlow<DataState>(DataState())
+    val dataState: StateFlow<DataState> = _dataState
+        .onStart { fetchData() }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = _dataState.value
+        )
+
+    private val _dataEvent = Channel<DataEvent>()
+    val dataEvent = _dataEvent.receiveAsFlow()
+
+
+    fun fetchData() {
+        viewModelScope.launch {
+            _dataState.update { state ->
+                state.copy(isLoading = true)
+            }
+            getDataFlowUseCase()
+                .catch { throwable ->
+                    val uiText = throwable.asApplicationException().toUiText()
+                    _dataEvent.send(DataEvent.ShowError(uiText))
+                }
+                .collect { data ->
+                    _dataState.update { state ->
+                        state.copy(
+                            data = data,
+                            isLoading = false
+                        )
+                    }
+                }
+        }
+    }
+
+    fun transformData() {
+        _dataState.update { state ->
+            val newTransformedList = state.data.map { item ->
+                item.reversed().uppercase()
+            }
+            state.copy(data = newTransformedList)
+        }
+    }
+
+    private fun transformData(data: String): String {
+        return data.reversed().uppercase()
+    }
+}
+
+class GetDataFlowUseCase @Inject constructor(
+    private val dataRepository: DataRepository,
+    private val networkObserver: NetworkObserver,
+    @DispatcherIO private val ioDispatcher: CoroutineDispatcher
+) {
+    operator fun invoke(): Flow<List<String>> = flow {
+        if (!networkObserver.status.value.isConnected()) {
+            throw ConnectionException()
+        }
+        emitAll(dataRepository.getData())
+
+    }.flowOn(ioDispatcher)
+}
+
+interface NetworkObserver {
+    val status: StateFlow<NetworkStatus>
+}
+
+enum class NetworkStatus {
+    ACTIVE,
+    INACTIVE;
+
+    fun isConnected(): Boolean {
+        return when (this) {
+            ACTIVE -> true
+            INACTIVE -> false
+        }
+    }
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+interface ConnectivityModule{
+
+    @Binds
+    fun bindNetworkObserver(impl: NetworkObserverImpl): NetworkObserver
+
+    companion object{
+        @Provides
+        @Singleton
+        fun provideConnectivityManager(
+            @ApplicationContext context: Context,
+        ): ConnectivityManager {
+            return context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        }
+
+        @Provides
+        @Singleton
+        fun provideApplicationScope(): CoroutineScope {
+            return  CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        }
+    }
+}
+
+class NetworkObserverImpl @Inject constructor(
+    private val connectivityManager: ConnectivityManager,
+    private val coroutineScope: CoroutineScope,
+) : NetworkObserver {
+
+    override val status: StateFlow<NetworkStatus> = callbackFlow {
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val capability = connectivityManager.getNetworkCapabilities(network) ?: return
+                if (capability.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    trySend(NetworkStatus.ACTIVE)
+                }
+            }
+
+            override fun onUnavailable() {
+                trySend(NetworkStatus.INACTIVE)
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+
+        connectivityManager.registerNetworkCallback(request, callback)
+        awaitClose {
+            connectivityManager.unregisterNetworkCallback(callback)
+        }
+    }.stateIn(
+        scope = coroutineScope,
+        started = SharingStarted.Eagerly,
+        initialValue = getCurrentStatus()
+    )
+
+    private fun getCurrentStatus(): NetworkStatus {
+        val network = connectivityManager.activeNetwork
+        val capability = connectivityManager.getNetworkCapabilities(network)
+        val hasNetworkCapabilities =
+            capability?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+
+        return when {
+            hasNetworkCapabilities -> NetworkStatus.ACTIVE
+            else -> NetworkStatus.INACTIVE
+        }
+    }
+}
+
+fun Throwable.asApplicationException(): ApplicationExceptions =
+    this as? ApplicationExceptions ?: UnknownException()
+
+//Customs exceptions
+sealed class ApplicationExceptions : Exception()
+class ConnectionException : ApplicationExceptions()
+class UnknownException : ApplicationExceptions()
+
+//Utils
+sealed interface UiText {
+    data class StringResource(
+        @StringRes val resId: Int,
+        val args: List<Any> = emptyList()
+    ) : UiText
+}
+
+fun ApplicationExceptions.toUiText(): UiText {
+    return when (this) {
+        is ConnectionException -> UiText.StringResource(resId = R.string.network_error)
+        is UnknownException -> UiText.StringResource(resId = R.string.unknown_error)
+    }
+}
+
+fun UiText.asString(context: Context): String {
+    return when (this) {
+        is UiText.StringResource -> context.getString(resId, *args.toTypedArray())
+    }
+}
