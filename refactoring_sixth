@@ -1,0 +1,322 @@
+object Constants {
+    val MediumPadding = 16.dp
+    val ExtraSmallPadding = 4.dp
+}
+
+@Composable
+fun UsersScreen(
+    modifier: Modifier = Modifier,
+    viewModel: UsersViewModel = hiltViewModel<UsersViewModel>()
+) {
+    val state by viewModel.usersState.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+
+    LaunchedEffect(Unit) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            viewModel.usersEvents.collect { events ->
+                when (events) {
+                    is UsersEvents.ShowToast -> {
+                        Toast.makeText(
+                            context,
+                            events.uiText.asString(context),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+        }
+    }
+
+
+    UsersContent(
+        modifier = modifier,
+        state = state,
+        onValueChange = (viewModel::setQuery),
+        onDeleteUserPressed = (viewModel::deleteUser),
+        onLogoutUserPressed = (viewModel::logoutUser)
+    )
+
+
+}
+
+@Composable
+fun UsersContent(
+    modifier: Modifier = Modifier,
+    state: UsersState,
+    onValueChange: (String) -> Unit,
+    onDeleteUserPressed: (User) -> Unit,
+    onLogoutUserPressed: () -> Unit,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(MediumPadding)
+    ) {
+        OutlinedTextField(
+            value = state.query ?: "",
+            onValueChange = {
+                onValueChange(it)
+            },
+            label = { Text(stringResource(R.string.search)) }
+        )
+
+        if (state.isLoading) {
+            CircularProgressIndicator(
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+        } else {
+            UsersList(
+                modifier = Modifier.weight(1f),
+                users = state.users,
+                onDeleteUserPressed = onDeleteUserPressed
+            )
+
+            Spacer(modifier = Modifier.height(ExtraSmallPadding))
+
+            Button(
+                onClick = { onLogoutUserPressed() }
+            ) {
+                Text(stringResource(R.string.log_out))
+            }
+        }
+    }
+}
+
+@Composable
+fun UsersList(
+    modifier: Modifier = Modifier,
+    users: ImmutableList<User>,
+    onDeleteUserPressed: (User) -> Unit,
+) {
+    LazyColumn (modifier = modifier) {
+        items(
+            items = users,
+            key = { it.id }
+        ) { user ->
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(ExtraSmallPadding)
+            ) {
+                Text(text = user.name)
+                IconButton(
+                    onClick = { onDeleteUserPressed(user) }
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_delete),
+                        contentDescription = stringResource(R.string.delete)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Immutable
+data class UsersState(
+    val users: ImmutableList<User> = persistentListOf(),
+    val isLoading: Boolean = true,
+    val query: String? = null,
+)
+
+sealed interface UsersEvents {
+    data class ShowToast(val uiText: UiText) : UsersEvents
+}
+
+@HiltViewModel
+class UsersViewModel @Inject constructor(
+    private val logOutUseCase: LogOutUseCase,
+    private val deleteUserUseCase: DeleteUsersUserCase,
+    private val getUserByQueryUseCase: GetUserByQueryUseCase,
+) : ViewModel() {
+
+    private val _usersState = MutableStateFlow<UsersState>(UsersState())
+    val usersState = _usersState.asStateFlow()
+
+    private val _debouncedQuery = _usersState
+        .map { it.query }
+        .distinctUntilChanged()
+        .debounce(300L)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000L),
+            initialValue = _usersState.value.query
+        )
+
+    private val _usersEvents = Channel<UsersEvents>()
+    val usersEvents = _usersEvents.receiveAsFlow()
+
+    init {
+        viewModelScope.launch {
+            _debouncedQuery.collectLatest {
+                loadUsers(it)
+            }
+        }
+    }
+
+    fun setQuery(query: String) {
+        _usersState.update { state ->
+            state.copy(
+                query = query
+            )
+        }
+    }
+
+    fun logoutUser() { 
+        logOutUseCase.clear()
+    }
+
+    fun deleteUser(user: User) {
+        viewModelScope.launch {
+            showLoading(true)
+            deleteUserUseCase(user.id)
+                .onSuccess {
+                    _usersEvents.send(
+                        UsersEvents.ShowToast(
+                            UiText.StringRes(
+                                R.string.successfully_deleted_user_toast,
+                                listOf(user.name)
+                            )
+                        )
+                    )
+                    loadUsers(_usersState.value.query)
+                }
+                .onFailure { throwable ->
+                    val uiText = (throwable as ApplicationException).displayedMessage
+                    _usersEvents.send(UsersEvents.ShowToast(uiText))
+                }
+            showLoading(false)
+        }
+    }
+
+    private suspend fun loadUsers(query: String?) {
+        showLoading(true)
+        getUserByQueryUseCase(query)
+            .collect { users ->
+                _usersState.update { state ->
+                    state.copy(
+                        users = users.toImmutableList(),
+                        isLoading = false
+                    )
+                }
+            }
+    }
+
+    private fun showLoading(isLoading: Boolean) {
+        _usersState.update { state ->
+            state.copy(
+                isLoading = isLoading
+            )
+        }
+    }
+}
+
+class GetUserByQueryUseCase @Inject constructor(
+    private val repository: UserRepository,
+) {
+    operator fun invoke(query: String? = null): Flow<List<User>> = repository.getUserByQuery(query)
+}
+
+class DeleteUsersUserCase @Inject constructor(
+    private val repository: UserRepository,
+) {
+    suspend operator fun invoke(id: String): Result<Unit> {
+        return repository.deleteUser(id)
+    }
+}
+
+data class User(
+    val id: String,
+    val name: String,
+)
+
+interface UserRepository {
+    fun getUserByQuery(query: String? = null): Flow<List<User>>
+    suspend fun deleteUser(id: String): Result<Unit>
+}
+
+@Singleton
+class UserRepositoryImpl @Inject constructor(
+    private val api: FakeUserApi
+) : UserRepository {
+
+    override fun getUserByQuery(query: String?): Flow<List<User>> = flow {
+        val users = api.getUsers(query)
+        emit(users)
+    }.catch { throw it.toApplicationException() }
+
+    override suspend fun deleteUser(id: String): Result<Unit> = runCatching {
+        api.deleteUser(id = id)
+    }.recoverCatching { throw it.toApplicationException() }
+
+}
+
+class FakeUserApi @Inject constructor() {
+
+    private val users = MutableList(50) {
+        User(
+            id = "${it + 1}",
+            name = "Random name: #$it"
+        )
+    }
+
+    suspend fun getUsers(query: String?): List<User> {
+        delay(500)
+        return if (!query.isNullOrBlank()) users.filter { user ->
+            user.name.contains(
+                query,
+                ignoreCase = true
+            )
+        }
+        else users.toList()
+    }
+
+    suspend fun deleteUser(id: String) {
+        delay(500)
+
+        if (id == "5") {
+            throw IllegalArgumentException("Fake server error!")
+        }
+
+        users.removeAll { it.id == id }
+    }
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+interface RepoModule {
+    @Binds
+    fun bindsUserRepo(impl: UserRepositoryImpl): UserRepository
+}
+
+sealed interface UiText {
+    data class StringRes(
+        val resId: Int,
+        val args: List<Any> = emptyList()
+    ) : UiText
+}
+
+
+fun UiText.asString(context: Context) = when (this) {
+    is UiText.StringRes -> context.getString(resId, *args.toTypedArray())
+}
+
+fun Throwable.toApplicationException(): ApplicationException {
+    return when (this) {
+        else -> UnknownException()
+    }
+}
+
+abstract class ApplicationException : Exception() {
+    abstract val displayedMessage: UiText
+}
+
+class ConnectionException(
+    override val displayedMessage: UiText = UiText.StringRes(R.string.connection_exception)
+) : ApplicationException()
+
+class UnknownException(
+    override val displayedMessage: UiText = UiText.StringRes(R.string.unknown_exception)
+) : ApplicationException()
